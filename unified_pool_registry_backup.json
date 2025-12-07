@@ -1,0 +1,26 @@
+{
+  "H8Jd92NnmXMAk9j7DEaPMEwaSKWu5ctFPb3nB4E6SoLH": {
+    "pool": "H8Jd92NnmXMAk9j7DEaPMEwaSKWu5ctFPb3nB4E6SoLH",
+    "ammId": "H8Jd92NnmXMAk9j7DEaPMEwaSKWu5ctFPb3nB4E6SoLH",
+    "ammAuthority": "AmmAuthPubkey...",
+    "openOrders": "OpenOrdersPubkey...",
+    "targetOrders": "TargetOrdersPubkey...",
+    "marketProgram": "srmqPv...",
+    "marketId": "SerumMarketPubkey...",
+    "marketBids": "BidsPubkey...",
+    "marketAsks": "AsksPubkey...",
+    "marketEventQueue": "EventQPubkey...",
+    "marketBaseVault": "BaseVaultPubkey...",
+    "marketQuoteVault": "QuoteVaultPubkey...",
+    "vaultA": "VaultAPubkey...",
+    "vaultB": "VaultBPubkey...",
+    "mintA": "MintAPubkey...",
+    "mintB": "MintBPubkey...",
+    "lpMint": "LpMintPubkey...",
+    "feeNumerator": 25,
+    "feeDenominator": 10000,
+    "ampFactor": 0,
+    "stable": false,
+    "volatile": true
+  }
+}
