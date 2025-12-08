@@ -1,6 +1,6 @@
 // priceScanner.js
-// FAST on-chain price scanner (Raydium / Orca / Meteora)
-// Logic preserved exactly; only syntax + bugs fixed.
+// AMM-only on-chain price scanner (Raydium + Orca)
+// Optimized for fewer RPC calls, correct price direction, and a strict 6 req/sec limiter.
 
 import { PublicKey } from "@solana/web3.js";
 import PQueue from "p-queue";
@@ -11,294 +11,119 @@ const rpcQueue = new PQueue({
   intervalCap: 6,       // EXACTLY 6 RPC calls per second
   concurrency: 6        // max 6 running at same time
 });
+async function q(fn) { return rpcQueue.add(fn); }
 
-// wrapper
-async function q(fn) {
-  return rpcQueue.add(fn);
-}
-
-const RPC_URL = process.env.RPC_URL_6 || "https://api.mainnet-beta.solana.com";
+const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const WSOL_MINT = "So11111111111111111111111111111111111111112";
 
 /* ---------------------- CONFIG --------------------- */
 export const DEX_PROGRAMS = {
-  // ---- Raydium AMM (v4 only) ----
   Raydium_AMM_v4: new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"),
-
-  // ---- Orca AMM (standard) ----
-  Orca_AMM: new PublicKey("9WwRZjZJ9n7bhCrwW1EpnBH3CCuZMdAsMNSnS9nTYa5"),
-
-  // ---- Meteora AMM (AMM/DLMM only) ----
-  Meteora_DLMM: new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"),
+  Orca_AMM:       new PublicKey("9WwRZjZJ9n7bhCrwW1EpnBH3CCuZMdAsMNSnS9nTYa5")
 };
-const TOKEN_PROGRAM_ID =
-  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
-/* ------------------- INTERNAL UTILS ------------------- */
-
-async function pMap(iterable, mapper, concurrency = 6) {
-  const ret = [];
-  const executing = new Set();
-  for (const item of iterable) {
-    // call mapper(item) directly (mapper may be async)
-    const p = (async () => mapper(item))();
-    ret.push(p);
-    executing.add(p);
-    p.finally(() => executing.delete(p));
-    if (executing.size >= concurrency) {
-      await Promise.race(executing);
-    }
-  }
-  return Promise.all(ret);
+/* ------------------- small helpers ------------------ */
+function bufToHex(b) {
+  if (!b) return "";
+  return Buffer.isBuffer(b) ? b.toString("hex") : Buffer.from(b).toString("hex");
 }
 
-function tryParseBase64Data(acc) {
-  if (!acc?.account?.data && !acc?.data) return null;
+function parsePossibleAccountData(acc) {
+  // Handle shapes returned by getProgramAccounts or getAccountInfo: support acc.account?.data, acc.data
+  const d = acc?.account?.data ?? acc?.data ?? null;
+  if (!d) return null;
 
-  // accept several shapes: parsed account (account.data), getAccountInfo (data), or program account (data as array)
-  const d = acc.account?.data ?? acc.data;
-
-  // case: [base64string, ...] (web3 getProgramAccounts returns [encoded, ...] sometimes)
+  // cases: [base64, encoding], Buffer, Uint8Array
   if (Array.isArray(d) && typeof d[0] === "string") {
-    try {
-      return Buffer.from(d[0], "base64");
-    } catch (_) { return null; }
+    try { return Buffer.from(d[0], "base64"); } catch { return null; }
   }
-
-  // Buffer or Uint8Array
   if (Buffer.isBuffer(d)) return d;
   if (d instanceof Uint8Array) return Buffer.from(d);
-
-  // some RPCs return object with 'data' and 'encoding' — already handled above
   return null;
 }
 
-/* ------------------- SCAN PROGRAM FOR MINT ------------------- */
-
-async function scanProgramForMint(connection, programId, mintPubkey, dataSliceLen = 200, maxResults = 50) {
-  const opts = {
-    dataSlice: { offset: 0, length: dataSliceLen },
-    commitment: "confirmed",
-    encoding: "base64",
-  };
-
-  let accounts = [];
-  try {
-    accounts = await rpcQueue.add(() =>
-      connection.getProgramAccounts(programId, opts)
-    );
-  } catch (_) {
-    return [];
+/* ---------- Candidate pubkeys extraction (less aggressive) ---------- */
+function extractCandidatePubkeysFromDataSlice(buf, limit = 8) {
+  // We scan with stride 8 (not 4) to reduce false positives while still catching misaligned layouts.
+  const set = new Set();
+  if (!buf || buf.length < 32) return [];
+  for (let offset = 0; offset + 32 <= buf.length; offset += 8) {
+    const slice = buf.slice(offset, offset + 32);
+    if (slice.equals(Buffer.alloc(32))) continue;
+    set.add(slice.toString("hex"));
+    if (set.size >= limit) break;
   }
-
-  const target = Buffer.from(new PublicKey(mintPubkey).toBuffer());
-  const out = [];
-
-  for (const acc of accounts) {
-    const slice = tryParseBase64Data(acc);
-    if (!slice) continue;
-    if (slice.indexOf(target) !== -1) {
-      out.push({ pubkey: acc.pubkey, dataSlice: slice, fullAccount: acc.account });
-      if (out.length >= maxResults) break;
-    }
-  }
-
-  return out;
+  return Array.from(set).map(h => (new PublicKey(Buffer.from(h, "hex"))).toBase58());
 }
 
-/* ------------------- TOKEN ACCOUNT PROBE ------------------- */
-
-async function probeTokenAccount(connection, candidatePubkey) {
+/* ------------------- probe token account ------------------- */
+async function probeTokenAccount(connection, pubkeyBase58) {
   try {
-    const info = await rpcQueue.add(() =>
-      connection.getParsedAccountInfo(new PublicKey(candidatePubkey), "confirmed")
-    ).catch(() => null);
-
+    const pub = new PublicKey(pubkeyBase58);
+    const info = await q(() => connection.getParsedAccountInfo(pub, "confirmed"));
     const val = info?.value;
     if (!val) return null;
 
-    // owner could be Pubkey or string (depending on RPC). Normalise.
+    // validate owner is SPL Token program
     const owner = val.owner ? (typeof val.owner.toString === "function" ? val.owner.toString() : String(val.owner)) : null;
-    if (owner !== TOKEN_PROGRAM_ID) return null;
+    if (!owner || !owner.includes("Tokenkeg")) return null;
 
-    const parsed = val.data?.parsed?.info ?? val.data?.parsed;
-    if (!parsed || !parsed.info) {
-      // some nodes give parsed.info nested; if not present, bail.
-      const altParsedInfo = val.data?.parsed?.info ?? parsed;
-      if (!altParsedInfo) return null;
-    }
+    const parsed = val.data?.parsed?.info ?? null;
+    if (!parsed) return null;
 
-    const mint = val.data?.parsed?.info?.mint ?? parsed.info?.mint;
-    const tokenAmount = val.data?.parsed?.info?.tokenAmount ?? parsed.info?.tokenAmount;
+    const mint = parsed.mint;
+    const tokenAmount = parsed.tokenAmount ?? parsed.tokenAmount; // defensive
+    const uiAmount = tokenAmount?.uiAmount ?? null;
+    const decimals = tokenAmount?.decimals ?? null;
+    const amountRaw = tokenAmount?.amount ? BigInt(tokenAmount.amount) : null;
 
-    return {
-      mint,
-      amountRaw: tokenAmount?.amount ? BigInt(tokenAmount.amount) : null,
-      uiAmount: tokenAmount?.uiAmount ?? null,
-      decimals: tokenAmount?.decimals ?? null,
-      pubkey: candidatePubkey
-    };
+    return { pubkey: pubkeyBase58, mint, uiAmount, amountRaw, decimals };
   } catch (_) {
     return null;
   }
 }
 
-/* ------------------- READ VAULT AMOUNT ------------------- */
-
-async function readVaultAmount(connection, vaultPubkey) {
-  // Try getParsedAccountInfo first (gives tokenAmount)
+/* ------------------- read vault amount robustly ------------------- */
+async function readVaultAmount(connection, vaultPub) {
+  // Try parsed first
   try {
-    const parsed = await rpcQueue.add(() =>
-      connection.getParsedAccountInfo(new PublicKey(vaultPubkey), "confirmed")
-    ).catch(() => null);
-
-    const val = parsed?.value;
-    if (
-      val &&
-      val.data &&
-      val.data.parsed &&
-      val.data.parsed.info &&
-      val.data.parsed.info.tokenAmount
-    ) {
-      const t = val.data.parsed.info.tokenAmount;
-
-      // raw amount
-      let amountRaw = null;
-
-      if (t.amount) {
-        // standard SPL amount
-        amountRaw = BigInt(t.amount);
-      } else if (
-        typeof t.uiAmount === "number" &&
-        typeof t.decimals === "number"
-      ) {
-        // fallback: convert uiAmount → raw
-        amountRaw = BigInt(
-          Math.floor(t.uiAmount * Math.pow(10, t.decimals))
-        );
-      }
-
-      return {
-        amountRaw,
-        uiAmount: t.uiAmount ?? null,
-        decimals: t.decimals ?? null
-      };
+    const parsed = await q(() => connection.getParsedAccountInfo(new PublicKey(vaultPub), "confirmed"));
+    const v = parsed?.value;
+    if (v && v.data && v.data.parsed && v.data.parsed.info && v.data.parsed.info.tokenAmount) {
+      const t = v.data.parsed.info.tokenAmount;
+      const amountRaw = t.amount ? BigInt(t.amount) : (typeof t.uiAmount === "number" && typeof t.decimals === "number"
+        ? BigInt(Math.floor(t.uiAmount * Math.pow(10, t.decimals)))
+        : null);
+      return { amountRaw, uiAmount: t.uiAmount ?? null, decimals: t.decimals ?? null };
     }
-  } catch (_) {
-    // parsed failed → continue to fallback
-  }
+  } catch (_) { /* continue to fallback */ }
 
-  // Fallback: raw account data reading (assume SPL token account layout: amount at offset 64 little-endian u64)
+  // Fallback raw account layout (u64 at offset 64 LE)
   try {
-    const raw = await rpcQueue.add(() =>
-      connection.getAccountInfo(new PublicKey(vaultPubkey), "confirmed")
-    ).catch(() => null);
-
-    const data = raw?.data ?? null;
+    const raw = await q(() => connection.getAccountInfo(new PublicKey(vaultPub), "confirmed"));
+    const data = raw?.data;
     if (!data) return null;
-
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
     if (buf.length >= 72) {
-      const amount = buf.readBigUInt64LE(64); // LE u64 at offset 64
-      return { amountRaw: amount, uiAmount: null, decimals: null };
+      const amountRaw = buf.readBigUInt64LE(64);
+      return { amountRaw, uiAmount: null, decimals: null };
     }
-  } catch (_) {
-    return null;
-  }
+  } catch (_) { /* ignore */ }
 
   return null;
 }
 
-/* ------------------- DECODE HELPERS (RAYD / ORCA / METEORA) ------------------- */
-// (no changes – same as your logic; omitted here to save space)
+/* ------------------- decode helpers (AMM only) ------------------- */
+/*
+  We'll implement a minimal set of offset attempts for Raydium v4 and Orca whirlpool.
+  These offsets are best-effort and chosen to catch typical layouts.
+*/
 
-/* ------------------- Candidate pubkey extraction ------------------------ */
-
-function extractCandidatePubkeysFromData(dataSliceBuf, limit = 10) {
-  const keys = new Set();
-  if (!dataSliceBuf) return [];
-  // scan with stride 4 to increase chance across different alignments
-  for (let offset = 0; offset + 32 <= dataSliceBuf.length; offset += 4) {
-    const candidate = dataSliceBuf.slice(offset, offset + 32);
-    if (candidate.equals(Buffer.alloc(32))) continue;
-    // small sanity: avoid very low-entropy sequences
-    keys.add(candidate.toString("hex"));
-    if (keys.size >= limit) break;
-  }
-  return Array.from(keys).map(h => (new PublicKey(Buffer.from(h, "hex"))).toBase58());
-}
-
-/* -------------------- Token-account probing helper --------------------- */
-/* (probeTokenAccount defined above — used here) */
-
-/* ------------- Vault amount: robust read (parsed -> raw -> u64) --------- */
-/* (readVaultAmount defined above — used throughout) */
-
-/* ---------------------- Decoders (multi-offset) ------------------------- */
-
-/**
- * decodeRaydiumAttempt(fullBuf)
- * Try several common Raydium (AMM / CLMM / v4) offsets — returns object or null
- */
-function decodeRaydiumAttempt(fullBuf) {
-  if (!fullBuf || fullBuf.length < 136) return null;
-  // Known successful slices (best-effort). We'll try multiple patterns.
-  const patterns = [
-    // pattern A (used earlier in some versions)
-    { mintA: [72, 104], mintB: [104, 136], vaultA: [136, 168], vaultB: [168, 200] },
-    // pattern B (shifted)
-    { mintA: [64, 96], mintB: [96, 128], vaultA: [128, 160], vaultB: [160, 192] },
-  ];
-
-  for (const p of patterns) {
-    if (fullBuf.length >= p.vaultB[1]) {
-      try {
-        const mintA = new PublicKey(fullBuf.slice(p.mintA[0], p.mintA[1])).toBase58();
-        const mintB = new PublicKey(fullBuf.slice(p.mintB[0], p.mintB[1])).toBase58();
-        const vaultA = new PublicKey(fullBuf.slice(p.vaultA[0], p.vaultA[1])).toBase58();
-        const vaultB = new PublicKey(fullBuf.slice(p.vaultB[0], p.vaultB[1])).toBase58();
-        return { mintA, mintB, vaultA, vaultB };
-      } catch (_) { /* ignore invalid pubkey conversions */ }
-    }
-  }
-  return null;
-}
-
-/**
- * decodeOrcaCLMMAttempt(fullBuf)
- * Multiple offsets for Orca Whirlpool (CLMM)
- * Known layout variants derived from public whirlpool layouts; tries multiple offsets.
- */
-function decodeOrcaCLMMAttempt(fullBuf) {
+function tryDecodeRaydium(fullBuf) {
   if (!fullBuf || fullBuf.length < 200) return null;
   const patterns = [
-    { mintA: [72, 104], mintB: [104, 136], vaultA: [168, 200], vaultB: [200, 232] }, // common-ish
-    { mintA: [40, 72], mintB: [72, 104], vaultA: [168, 200], vaultB: [200, 232] },  // alternative used earlier
-    { mintA: [64, 96], mintB: [96, 128], vaultA: [160, 192], vaultB: [192, 224] },  // shifted
-  ];
-
-  for (const p of patterns) {
-    if (fullBuf.length >= p.vaultB[1]) {
-      try {
-        const mintA = new PublicKey(fullBuf.slice(p.mintA[0], p.mintA[1])).toBase58();
-        const mintB = new PublicKey(fullBuf.slice(p.mintB[0], p.mintB[1])).toBase58();
-        const vaultA = new PublicKey(fullBuf.slice(p.vaultA[0], p.vaultA[1])).toBase58();
-        const vaultB = new PublicKey(fullBuf.slice(p.vaultB[0], p.vaultB[1])).toBase58();
-        return { mintA, mintB, vaultA, vaultB };
-      } catch (_) {}
-    }
-  }
-  return null;
-}
-
-/**
- * decodeMeteoraDLMMAttempt(fullBuf)
- * Try a few offsets for Meteora/DLMM (best-effort)
- */
-function decodeMeteoraDLMMAttempt(fullBuf) {
-  if (!fullBuf || fullBuf.length < 200) return null;
-  const patterns = [
-    { mintA: [32, 64], mintB: [64, 96], vaultA: [160, 192], vaultB: [192, 224] },
-    { mintA: [72, 104], mintB: [104, 136], vaultA: [136, 168], vaultB: [168, 200] },
+    { mintA: [72,104], mintB: [104,136], vaultA: [136,168], vaultB: [168,200] },
+    { mintA: [64,96],  mintB: [96,128],  vaultA: [128,160], vaultB: [160,192] }
   ];
   for (const p of patterns) {
     if (fullBuf.length >= p.vaultB[1]) {
@@ -314,29 +139,107 @@ function decodeMeteoraDLMMAttempt(fullBuf) {
   return null;
 }
 
-/* ----------------------- Inspect matched pool account -------------------- */
+function tryDecodeOrca(fullBuf) {
+  if (!fullBuf || fullBuf.length < 232) return null;
+  const patterns = [
+    { mintA: [72,104], mintB: [104,136], vaultA: [168,200], vaultB: [200,232] },
+    { mintA: [64,96],  mintB: [96,128],  vaultA: [160,192], vaultB: [192,224] }
+  ];
+  for (const p of patterns) {
+    if (fullBuf.length >= p.vaultB[1]) {
+      try {
+        const mintA = new PublicKey(fullBuf.slice(p.mintA[0], p.mintA[1])).toBase58();
+        const mintB = new PublicKey(fullBuf.slice(p.mintB[0], p.mintB[1])).toBase58();
+        const vaultA = new PublicKey(fullBuf.slice(p.vaultA[0], p.vaultA[1])).toBase58();
+        const vaultB = new PublicKey(fullBuf.slice(p.vaultB[0], p.vaultB[1])).toBase58();
+        return { mintA, mintB, vaultA, vaultB };
+      } catch (_) {}
+    }
+  }
+  return null;
+}
 
-async function inspectPoolAccount(connection, matched, targetMint, otherMintOpt = null) {
+/* ------------------- inspectPoolAccount (reduced RPC) ------------------- */
+async function inspectPoolAccount(connection, matched, targetMint) {
+  // matched: { pubkey, dataSlice, fullAccount (optional) }
   const result = {
-    poolAccount: matched.pubkey,
-    matchedDataSnippet: matched.dataSlice,
+    poolAccount: matched.pubkey.toString(),
+    matchedDataSnippet: bufToHex(matched.dataSlice).slice(0, 400),
     vaults: [],
     reserves: {},
     priceInSOL: null,
     decimals: null,
-    extra: {}
+    dex: null
   };
 
-  // extract candidate pubkeys
-  const candidates = extractCandidatePubkeysFromData(matched.dataSlice, 16);
+  // first, attempt to decode from full account if available (faster and more deterministic)
+  let fullBuf = null;
+  if (matched.fullAccount) {
+    fullBuf = parsePossibleAccountData(matched.fullAccount);
+  }
+  // if full not present, we'll request only once below (queued)
+  if (!fullBuf) {
+    try {
+      const acc = await q(() => connection.getAccountInfo(matched.pubkey, "confirmed"));
+      fullBuf = parsePossibleAccountData({ data: acc?.data });
+    } catch (_) { fullBuf = null; }
+  }
 
-  // probe candidates for token accounts
-  const probes = await pMap(candidates, async (c) => await probeTokenAccount(connection, c), 8);
-  const valid = probes.filter(Boolean);
+  // Attempt AMM-specific decodes
+  let decoded = null;
+  if (fullBuf) {
+    decoded = tryDecodeRaydium(fullBuf) || tryDecodeOrca(fullBuf) || null;
+  }
 
-  // prefer vaults whose mint is targetMint and counterpart mint
+  // If decoders found vaults explicitly, read vault amounts directly (two RPC calls)
+  if (decoded && decoded.vaultA && decoded.vaultB) {
+    const [aInfo, bInfo] = await Promise.all([
+      readVaultAmount(connection, decoded.vaultA).catch(() => null),
+      readVaultAmount(connection, decoded.vaultB).catch(() => null)
+    ]);
+    const vA = { pubkey: decoded.vaultA, mint: decoded.mintA, ...aInfo };
+    const vB = { pubkey: decoded.vaultB, mint: decoded.mintB, ...bInfo };
+    result.vaults = [vA, vB];
+    result.reserves[vA.mint] = { amountRaw: vA.amountRaw, uiAmount: vA.uiAmount, decimals: vA.decimals };
+    result.reserves[vB.mint] = { amountRaw: vB.amountRaw, uiAmount: vB.uiAmount, decimals: vB.decimals };
+
+    // compute priceInSOL in canonical way: tokenPriceInSOL = reserveSOL / reserveToken
+    // determine which vault is WSOL
+    const aIsSOL = vA.mint === WSOL_MINT;
+    const bIsSOL = vB.mint === WSOL_MINT;
+
+    try {
+      const aAmt = vA.amountRaw !== null ? Number(vA.amountRaw) : (vA.uiAmount || 0);
+      const bAmt = vB.amountRaw !== null ? Number(vB.amountRaw) : (vB.uiAmount || 0);
+
+      if (aIsSOL && !bIsSOL && bAmt > 0) {
+        result.priceInSOL = aAmt / bAmt;           // SOL / token  => token price in SOL
+      } else if (bIsSOL && !aIsSOL && aAmt > 0) {
+        result.priceInSOL = bAmt / aAmt;
+      } else {
+        // fallback: assume mint order a->b corresponds to token->quote and return b/a
+        if (aAmt > 0 && bAmt > 0) result.priceInSOL = bAmt / aAmt;
+      }
+    } catch (_) { /* leave priceInSOL null */ }
+
+    // attach decimals (prefer token decimals)
+    result.decimals = (vA.decimals ?? vB.decimals) || null;
+    return result;
+  }
+
+  // If decoder didn't find vaults, fall back to candidate scanning but limit probes (cheap)
+  // Extract candidate pubkeys from data slice (this is a light pass)
+  const candidates = extractCandidatePubkeysFromData(matched.dataSlice, 12);
+  if (!candidates || candidates.length === 0) return result;
+
+  // Probe candidates concurrently but limited by rpcQueue underlying concurrency
+  const probePromises = candidates.map(c => probeTokenAccount(connection, c));
+  const probes = await Promise.all(probePromises);
+  const valid = (probes.filter(Boolean)).slice(0, 6); // keep a few valid candidates
+
+  // Find targetMint + counterpart
   const target = valid.filter(v => v.mint === targetMint);
-  const others = otherMintOpt ? valid.filter(v => v.mint === otherMintOpt) : valid.filter(v => v.mint !== targetMint);
+  const others = valid.filter(v => v.mint !== targetMint);
 
   let chosen = [];
   if (target.length >= 1 && others.length >= 1) {
@@ -345,163 +248,125 @@ async function inspectPoolAccount(connection, matched, targetMint, otherMintOpt 
     chosen = [valid[0], valid[1]];
   } else if (valid.length === 1) {
     chosen = [valid[0]];
+  } else {
+    return result;
   }
 
-  // populate info
-  for (const v of chosen) {
-    // attempt to get robust vault amount if parsed missing
-    const vaultInfo = await readVaultAmount(connection, v.pubkey);
-    const amountRaw = vaultInfo?.amountRaw ?? v.amountRaw;
-    const uiAmount = vaultInfo?.uiAmount ?? v.uiAmount;
-    const decimals = vaultInfo?.decimals ?? v.decimals;
-    result.vaults.push({ pubkey: v.pubkey, mint: v.mint, amountRaw, uiAmount, decimals });
-    result.reserves[v.mint] = { amountRaw, uiAmount, decimals };
+  // read vault amounts for chosen set
+  const reads = chosen.map(c => readVaultAmount(connection, c.pubkey).catch(() => null));
+  const amounts = await Promise.all(reads);
+
+  const vaults = [];
+  for (let i = 0; i < chosen.length; i++) {
+    const c = chosen[i];
+    const a = amounts[i];
+    const amountRaw = a?.amountRaw ?? c.amountRaw ?? null;
+    const uiAmount = a?.uiAmount ?? c.uiAmount ?? null;
+    const decimals = a?.decimals ?? c.decimals ?? null;
+    vaults.push({ pubkey: c.pubkey, mint: c.mint, amountRaw, uiAmount, decimals });
+    result.reserves[c.mint] = { amountRaw, uiAmount, decimals };
     if (!result.decimals && typeof decimals === "number") result.decimals = decimals;
   }
 
-  // price calculation if two vaults known
-  if (chosen.length >= 2) {
-    const a = chosen[0], b = chosen[1];
-    const aReserve = result.reserves[a.mint];
-    const bReserve = result.reserves[b.mint];
-    const aAmt = aReserve?.amountRaw !== null && typeof aReserve?.amountRaw !== "undefined" ? Number(aReserve.amountRaw) : (aReserve?.uiAmount || 0);
-    const bAmt = bReserve?.amountRaw !== null && typeof bReserve?.amountRaw !== "undefined" ? Number(bReserve.amountRaw) : (bReserve?.uiAmount || 0);
-    if (aAmt > 0 && bAmt > 0) {
-      // best-effort: price = reserveB / reserveA
-      result.priceInSOL = bAmt / aAmt;
-    }
+  // compute price like above if both available
+  if (vaults.length >= 2) {
+    try {
+      const v0 = vaults[0], v1 = vaults[1];
+      const aAmt = v0.amountRaw !== null ? Number(v0.amountRaw) : (v0.uiAmount || 0);
+      const bAmt = v1.amountRaw !== null ? Number(v1.amountRaw) : (v1.uiAmount || 0);
+      const aIsSOL = v0.mint === WSOL_MINT;
+      const bIsSOL = v1.mint === WSOL_MINT;
+      if (aIsSOL && !bIsSOL && bAmt > 0) result.priceInSOL = aAmt / bAmt;
+      else if (bIsSOL && !aIsSOL && aAmt > 0) result.priceInSOL = bAmt / aAmt;
+      else if (aAmt > 0 && bAmt > 0) result.priceInSOL = bAmt / aAmt;
+    } catch (_) { /* ignore */ }
   }
 
+  result.vaults = vaults;
   return result;
 }
 
 /* ----------------------------- Main scanMintFast ------------------------- */
-
+/**
+ * scanMintFast(connection, mint, opts)
+ * - connection: solana Connection
+ * - mint: mint address (string | PublicKey)
+ * - opts: { dataSliceLen, maxProgramAccountsToCheck, solPriceUsd }
+ *
+ * Returns:
+ *   { dex, programId, found, poolAccount, inspection, priceInSOL, priceInUSD, vaults, reserves, decimals, extra }
+ */
 export async function scanMintFast(connection, mint, opts = {}) {
   const mintKey = new PublicKey(mint);
   const dataSliceLen = opts.dataSliceLen ?? 200;
+  const maxProgramAccountsToCheck = opts.maxProgramAccountsToCheck ?? 200;
   const solPriceUsd = typeof opts.solPriceUsd === "number" ? opts.solPriceUsd : null;
 
   const scans = [
-    { id: "raydium", programs: [DEX_PROGRAMS.Raydium_AMM_v4] },
-    { id: "orca", programs: [DEX_PROGRAMS.Orca_AMM] },
-    { id: "meteora", programs: [DEX_PROGRAMS.Meteora_DLMM] },
+    { id: "raydium", program: DEX_PROGRAMS.Raydium_AMM_v4 },
+    { id: "orca",    program: DEX_PROGRAMS.Orca_AMM }
   ];
 
-  const scanPromises = scans.map(async (s) => {
-    for (const programId of s.programs) {
+  // iterate scans sequentially to stop early when we find a good pool
+  for (const s of scans) {
+    try {
+      // 1) getProgramAccounts with a small dataSlice to reduce payloads
+      const optsGetProg = {
+        dataSlice: { offset: 0, length: dataSliceLen },
+        commitment: "confirmed",
+        encoding: "base64"
+      };
 
-      // ---- QUEUED ----
-      const matches = await q(() =>
-        scanProgramForMint(connection, programId, mintKey, dataSliceLen, 40)
-      );
-      // -----------------
+      const rawAccounts = await q(() => connection.getProgramAccounts(s.program, optsGetProg)).catch(() => []);
+      if (!Array.isArray(rawAccounts) || rawAccounts.length === 0) continue;
 
-      if (!matches || matches.length === 0) continue;
-
-      const limited = matches.slice(0, Math.min(matches.length, 8));
-      for (const m of limited) {
-
-        let decoded = null;
-        try {
-
-          // ---- QUEUED ----
-          const fullAccount = await q(() =>
-            connection.getAccountInfo(m.pubkey, "confirmed")
-          );
-          // -----------------
-
-          const fullBuf = fullAccount?.data ? Buffer.from(fullAccount.data) : null;
-
-          if (s.id === "raydium" && fullBuf) {
-            decoded = decodeRaydiumAttempt(fullBuf);
-          } else if (s.id === "orca" && fullBuf) {
-            decoded = decodeOrcaCLMMAttempt(fullBuf);
-          } else if (s.id === "meteora" && fullBuf) {
-            decoded = decodeMeteoraDLMMAttempt(fullBuf);
-          }
-        } catch (_) {}
-
-        // If decoder found vaults, check them
-        if (decoded && decoded.vaultA && decoded.vaultB) {
-
-          // ---- QUEUED ----
-          const vaultAInfo = await q(() =>
-            readVaultAmount(connection, decoded.vaultA)
-          );
-          const vaultBInfo = await q(() =>
-            readVaultAmount(connection, decoded.vaultB)
-          );
-          // -----------------
-
-          const aAmt = vaultAInfo?.amountRaw ?? null;
-          const bAmt = vaultBInfo?.amountRaw ?? null;
-
-          if ((aAmt && aAmt > 0n) || (bAmt && bAmt > 0n) ||
-              (vaultAInfo?.uiAmount > 0) || (vaultBInfo?.uiAmount > 0)) {
-
-            const inspection = {
-              vaults: [
-                { pubkey: decoded.vaultA, mint: decoded.mintA, amountRaw: vaultAInfo?.amountRaw ?? null, uiAmount: vaultAInfo?.uiAmount ?? null, decimals: vaultAInfo?.decimals ?? null },
-                { pubkey: decoded.vaultB, mint: decoded.mintB, amountRaw: vaultBInfo?.amountRaw ?? null, uiAmount: vaultBInfo?.uiAmount ?? null, decimals: vaultBInfo?.decimals ?? null }
-              ],
-              reserves: {},
-              priceInSOL: null,
-              decimals: null
-            };
-
-            const v0 = inspection.vaults[0], v1 = inspection.vaults[1];
-            const v0num = v0.amountRaw ? Number(v0.amountRaw) : (v0.uiAmount || 0);
-            const v1num = v1.amountRaw ? Number(v1.amountRaw) : (v1.uiAmount || 0);
-            if (v0num > 0 && v1num > 0) inspection.priceInSOL = v1num / v0num;
-
-            return { dex: s.id, programId: programId.toBase58(), matched: m, inspection };
-          }
-        }
-
-        // ---- QUEUED ----
-        const inspection = await q(() =>
-          inspectPoolAccount(connection, m, mintKey.toBase58())
-        );
-        // -----------------
-
-        if (inspection && inspection.vaults && inspection.vaults.length > 0) {
-          return { dex: s.id, programId: programId.toBase58(), matched: m, inspection };
+      // 2) filter matching accounts by presence of mint bytes in the slice
+      const targetBuf = Buffer.from(mintKey.toBuffer());
+      const matches = [];
+      for (const acc of rawAccounts) {
+        const slice = parsePossibleAccountData(acc);
+        if (!slice) continue;
+        if (slice.indexOf(targetBuf) !== -1) {
+          matches.push({ pubkey: acc.pubkey, dataSlice: slice, fullAccount: acc.account ?? null });
+          if (matches.length >= Math.min(40, maxProgramAccountsToCheck)) break;
         }
       }
+      if (matches.length === 0) continue;
+
+      // 3) inspect matches one-by-one (lightweight inspect first, heavier read only when necessary)
+      for (const m of matches) {
+        try {
+          const inspection = await inspectPoolAccount(connection, m, mintKey.toBase58());
+          // if inspection contains vaults & positive reserves return immediately
+          const vaults = inspection.vaults || [];
+          const hasReserve = vaults.some(v => (v.amountRaw && v.amountRaw > 0n) || (v.uiAmount && v.uiAmount > 0));
+          if (hasReserve) {
+            const priceInSOL = inspection.priceInSOL ?? null;
+            const priceInUSD = (priceInSOL !== null && solPriceUsd !== null) ? (priceInSOL * solPriceUsd) : null;
+            return {
+              dex: s.id,
+              programId: s.program.toBase58(),
+              found: true,
+              poolAccount: m.pubkey.toBase58(),
+              matchedAccountDataSnippet: bufToHex(m.dataSlice).slice(0, 400),
+              vaults: inspection.vaults,
+              reserves: inspection.reserves,
+              decimals: inspection.decimals,
+              priceInSOL,
+              priceInUSD,
+              extra: { inspection }
+            };
+          }
+        } catch (e) {
+          // Continue to next match on errors
+          continue;
+        }
+      }
+    } catch (_) {
+      // isolated scan error -> continue to next DEX
+      continue;
     }
-    return null;
-  });
-
-  const results = await Promise.all(scanPromises);
-  const good = results.find(r => r !== null);
-
-  if (!good) {
-    return { dex: null, found: false, reason: "no_pool_found" };
   }
 
-  const { dex, programId, matched, inspection } = good;
-
-  const priceInSOL = inspection.priceInSOL ?? null;
-  const vaults = inspection.vaults || [];
-  const reserves = inspection.reserves || {};
-  const decimals = inspection.decimals ?? null;
-
-  const priceInUSD = (priceInSOL !== null && solPriceUsd !== null)
-    ? (priceInSOL * solPriceUsd)
-    : null;
-
-  return {
-    dex,
-    programId,
-    found: true,
-    poolAccount: matched.pubkey.toBase58(),
-    matchedAccountDataSnippet: matched.dataSlice ? matched.dataSlice.toString("hex").slice(0, 400) : null,
-    vaults,
-    reserves,
-    decimals,
-    priceInSOL,
-    priceInUSD,
-    extra: { inspection }
-  };
+  return { dex: null, found: false, reason: "no_pool_found" };
 }
