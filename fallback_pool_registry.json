@@ -1,0 +1,26 @@
+{
+  "8HoQnePLqPj4M7PUDzfw8e3Ymdwgc7NLGnaTUapubyvu": {
+    "ammId": "8HoQnePLqPj4M7PUDzfw8e3Ymdwgc7NLGnaTUapubyvu",
+
+    "mintA": "So11111111111111111111111111111111111111112",
+    "mintB": "EPjFWdd5AufqSSqeM2qN1xzybapC8n3gwYgPDaXJ8",
+
+    "lpMint": "HZ7iD7PnpEASDbFB8N44qYWjtFjZ1DuQH9JpP6DkECJd",
+
+    "ammAuthority": "4pQ8iKsE3FA7fszcRjBxCZEpwdxYDwLGUjwyDJqRrzym",
+    "marketId": "9wFFo5AFzvW5qp6cT7s8G9Gug1JGJtWbJ5EiYrH2fM4A",
+    "serumProgram": "9xQeWvG816bUx9EPfDdQKdarDC5QwEPuQ7yKZg2Yy9k",
+
+    "version": 4,
+    "stable": false,
+    "volatile": true,
+
+    "retry": {
+      "minDelayMs": 200,
+      "maxDelayMs": 1800,
+      "maxRetries": 5,
+      "factor": 1.7,
+      "jitter": true
+    }
+  }
+}
