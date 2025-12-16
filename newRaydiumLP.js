@@ -105,10 +105,15 @@ async function isFreshMint(mintAddress, maxAgeSec = 300) {
 }
 
 async function isFreshPool(poolId, minAgeSec = 30, maxAgeSec = 300) {
+  if (process.env.TEST_MODE === "true") {
+    console.log("[TEST_MODE] Skipping pool age check");
+    return true;
+  }
+
   const sigs = await getSignaturesForAddress(poolId, 1);
   if (!sigs.length || !sigs[0].blockTime) return false;
-  const age =
-    Math.floor(Date.now() / 1000) - sigs[0].blockTime;
+
+  const age = Math.floor(Date.now() / 1000) - sigs[0].blockTime;
   return age >= minAgeSec && age <= maxAgeSec;
 }
 
@@ -227,15 +232,19 @@ async function sendTelegramAlert(pool) {
 /* ============================= MAIN ============================= */
 
 async function main() {
-  const candidateLPs = [
-    {
-      poolId: "POOL_ACCOUNT",
-      mintAddress: "NEW_TOKEN_MINT",
-      mintB: "So11111111111111111111111111111111111111112",
-      vaultA: "VAULT_A",
-      vaultB: "VAULT_B"
-    }
-  ];
+  const candidateLPs = process.env.TEST_MODE === "true"
+  ? [
+      {
+        poolId: "8HoQnePLqPj4M7PUDzfw8e3Ymdwgc7NLGnaTUapubyvu",
+        mintAddress: "So11111111111111111111111111111111111111112",
+        mintB: "EPjFWdd5AufqSSqeM2qN1xzybapC8n3gxYGpDaXJ8",
+        vaultA: "So11111111111111111111111111111111111111112",
+        vaultB: "EPjFWdd5AufqSSqeM2qN1xzybapC8n3gxYGpDaXJ8"
+      }
+    ]
+  : [
+      // ORIGINAL CANDIDATE POOLS (or leave empty if dynamic)
+    ];
 
   for (const lp of candidateLPs) {
     if (!(await isFreshMint(lp.mintAddress))) continue;
